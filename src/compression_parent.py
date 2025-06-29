@@ -265,13 +265,15 @@ class CompressedLinear(nn.Module):
             # print("current kwargs", kwargs)
             # print("reconstruct kwargs", self.reconstruct_kwargs)
             # raise ValueError("stop here")
-            # print("returning cached")
+            print("returning cached")
             # check that the kwargs are the same
             if self.reconstruct_kwargs == kwargs:
                 return self.cached_reconstruct
         if kwargs.get("cache", False):
+            print('other cache path')
             self.cache_reconstruct(**kwargs)
             return self.reconstruct(**kwargs)
+        print('current kwargs', kwargs)
         return self.reconstruct_(**kwargs)
 
     def cache_reconstruct(self, offload: bool = False, **kwargs):
@@ -299,14 +301,19 @@ class CompressedLinear(nn.Module):
         with torch.no_grad():
             # if weight is none, then just return the mean squared error
             if error_weight is None:
+                print('reconstruction error with no weight')
                 return torch.mean((self.reconstruct() - self.original_weight) ** 2)
             # if its a 1d vector, then we assume its the diagonal of the hessian
             if len(error_weight.shape) == 1:
+                print('reconstruction error assumming hessian diag')
+                print('original_weight sum', torch.sum(self.original_weight))
+                print('error weight sum', torch.sum(error_weight))
                 return torch.mean(
                     (self.reconstruct() - self.original_weight) ** 2
                     * error_weight.unsqueeze(0)
                 )
             else:
+                print('Final reconstruction error path, probably assuming full hessian')
                 return hessian_general_align.loss(
                     self.reconstruct(), self.original_weight, error_weight
                 )

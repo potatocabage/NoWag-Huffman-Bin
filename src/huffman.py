@@ -1,0 +1,603 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import transformers
+import math
+import numpy as np
+import os
+import heapq
+import time
+from dahuffman import HuffmanCodec
+import random
+from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
+
+class HuffmanUser:
+
+    def __init__(self, strategy, **kwargs):
+        """
+        Initializes the HuffmanUser with a specific encoding strategy.
+        
+        Args:
+            strategy: a string that maps to an instance of a Huffman encoding strategy class.
+        """
+
+        seed = 42
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        available_strategies = ['HuffmanStrategy', 'DaHuffmanStrategy']
+        if strategy not in available_strategies:
+            raise ValueError("Invalid strategy. Available strategies: " + ", ".join(available_strategies))
+        
+        if strategy == 'HuffmanStrategy':
+            self.strategy = HuffmanStrategy()
+        elif strategy == 'DaHuffmanStrategy':
+            self.strategy = DaHuffmanStrategy()
+        
+        self.stats = {}
+    
+    def encode(self, assignments):
+        """
+        Encodes the assignments using the specified strategy.
+        """
+        res = self.strategy.encode(assignments)
+        self.stats = res['stats']
+        self.bit_count_matrix = res['bit_count_matrix']
+        self.huffman_codes = res['huffman_codes']
+        return res
+    
+    def column_permute(self, bit_count_matrix, bin_size, bin_bit_limit, heuristic_metric, heuristic_algo, lsa_metric, lsa_prep, heuristic=True, lsa=True):
+        #TODO: return final permutation indices for use of decoding
+        """
+        Permutes the columns of the matrix based on the Huffman codes.
+        
+        Args:
+            bit_count_matrix: The matrix to permute.
+        
+        Returns:
+            A permuted version of the input matrix.
+        """
+
+        print("bit_count_matrix shape", bit_count_matrix.shape)
+
+        n_bins = bit_count_matrix.shape[1] // bin_size
+
+        # pad so that columns are divisible by bin_size
+        pad = (bin_size - bit_count_matrix.shape[1] % bin_size) % bin_size
+        if pad > 0:
+            bit_count_matrix = np.pad(bit_count_matrix, ((0, 0), (0, pad)), mode='constant', constant_values=0)
+        print("bit_count_matrix shape after padding", bit_count_matrix.shape)
+
+        
+        final_permuted_indices = np.arange(bit_count_matrix.shape[1])
+
+        permuted_bit_count_matrix = bit_count_matrix.copy()
+        if heuristic:
+            # Apply heuristic-based column permutation
+            if heuristic_metric == 'sum':
+                # Sort columns by sum of bit counts
+                col_sums = np.sum(bit_count_matrix, axis=0)
+                sorted_indices = np.argsort(col_sums)[::-1]
+                # print(sorted_indices)
+                print('sorted col sums', np.sort(col_sums)[::-1])
+            elif heuristic_metric == 'output_normed_sum':
+                output_norms = np.linalg.norm(bit_count_matrix, axis=1)
+                normalized_matrix = bit_count_matrix / (output_norms.reshape(-1,1) + 1e-10)  # Avoid division by zero
+                col_sums = np.sum(normalized_matrix, axis=0)
+                sorted_indices = np.argsort(col_sums)[::-1]
+            # elif heuristic_metric == 'none':
+            #     sorted_indices = np.arange(bit_count_matrix.shape[1])
+            else:
+                raise ValueError("Invalid heuristic metric. Choose 'sum' or 'output_normed_sum'.")
+        
+            if heuristic_algo == "round_robin":
+                # Round Robin allocation of sorted columns into bins
+                for i in range(len(sorted_indices)):
+                    pi = (i % n_bins) * bin_size + (i // n_bins)
+                    # print(pi)
+                    permuted_bit_count_matrix[:, pi] = bit_count_matrix[:, sorted_indices[i]]
+                    final_permuted_indices[pi] = sorted_indices[i]
+
+            #TODO: only works for even bin size
+            elif heuristic_algo == "min_max":
+                for i in range(len(sorted_indices)//2):
+                    pi = (i % n_bins) * bin_size + (i // n_bins)
+                    permuted_bit_count_matrix[:, pi] = bit_count_matrix[:, sorted_indices[i]]
+                    final_permuted_indices[pi] = sorted_indices[i]
+
+                    pj = ((i % n_bins)+1) * bin_size - ((i // n_bins)+1)
+                    permuted_bit_count_matrix[:, pj] = bit_count_matrix[:, sorted_indices[-(i+1)]]
+                    final_permuted_indices[pj] = sorted_indices[-(i+1)]
+                    # print(f"{pi}, {pj}")
+            assert (sorted(final_permuted_indices) == np.arange(bit_count_matrix.shape[1])).all()
+            
+
+            
+        if lsa:
+            # # TODO: Need to shuffle each bin in order for LSA to do anything
+            # # trying to flip every other bin first
+            # if lsa_prep == 'flip':
+            #     for bin_i in range(n_bins):
+            #         if bin_i % 2:
+            #             permuted_bit_count_matrix[:,bin_i*bin_size:(bin_i+1)*bin_size] = permuted_bit_count_matrix[:,(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
+            # elif lsa_prep == 'shuffle':
+            #     # permuted_bit_count_matrix = permuted_bit_count_matrix.reshape(-1,n_bins,bin_size)
+            #     # permuted_bit_count_matrix = np.transpose(permuted_bit_count_matrix, (-1,0,1))
+            #     # permuted_bit_count_matrix = np.shuffle
+            #     old_sum = np.sum(permuted_bit_count_matrix)
+            #     for i in range(n_bins):
+            #         shuffled_bin = permuted_bit_count_matrix[i*bin_size:(i+1)*bin_size].copy().T
+            #         np.random.shuffle(shuffled_bin)
+            #         permuted_bit_count_matrix[i*bin_size:(i+1)*bin_size] = shuffled_bin.T
+            #     new_sum = np.sum(permuted_bit_count_matrix)
+            #     assert old_sum == new_sum
+            #     # pass
+            # elif lsa_prep != 'none':
+            #     raise NotImplementedError
+
+
+            # Apply LSA-based column permutation
+            # Currently this is iterative
+            # TODO: KEEP ITERATING UNTIL AN EARLY STOP IS TRIGGERED
+
+            num_iterations = 10
+            print('num iterations', num_iterations)
+            if lsa_metric == 'bit_violation':
+                prev_violations = np.sum(np.clip(self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit), a_min=0, a_max=None))
+            elif lsa_metric == 'num_violation':
+                prev_violations = np.sum((self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit) > 0).astype(int))
+
+            os.makedirs('lsa_progress_logs', exist_ok=True)
+            with open(os.path.join('lsa_progress_logs', f'4_to_3__{lsa_prep}__{lsa_metric}.txt'), 'w') as f:
+                for i in range(num_iterations):
+                    f.write(f'{prev_violations}, ')
+                    f.flush()
+                    # TODO: Need to shuffle each bin in order for LSA to do anything
+                    # trying to flip every other bin first
+                    if lsa_prep == 'flip':
+                        for bin_i in range(n_bins):
+                            if bin_i % 2:
+                                permuted_bit_count_matrix[:,bin_i*bin_size:(bin_i+1)*bin_size] = permuted_bit_count_matrix[:,(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
+                                final_permuted_indices[bin_i*bin_size:(bin_i+1)*bin_size] = final_permuted_indices[(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
+                    elif lsa_prep == 'shuffle':
+                        # permuted_bit_count_matrix = permuted_bit_count_matrix.reshape(-1,n_bins,bin_size)
+                        # permuted_bit_count_matrix = np.transpose(permuted_bit_count_matrix, (-1,0,1))
+                        # permuted_bit_count_matrix = np.shuffle
+                        old_sum = np.sum(permuted_bit_count_matrix)
+
+                        for i in range(n_bins):
+                            shuffled_bin = permuted_bit_count_matrix[:, i*bin_size:(i+1)*bin_size].copy().T
+                            # print('shuffled bin transpose shape', shuffled_bin.shape)
+                            shuffled_bin = np.hstack((shuffled_bin, final_permuted_indices[i*bin_size:(i+1)*bin_size].reshape(-1,1)))
+                            np.random.shuffle(shuffled_bin)
+                            permuted_bit_count_matrix[:, i*bin_size:(i+1)*bin_size] = shuffled_bin[:,:-1].T
+                            final_permuted_indices[i*bin_size:(i+1)*bin_size] = shuffled_bin[:,-1].T
+
+                        new_sum = np.sum(permuted_bit_count_matrix)
+                        assert old_sum == new_sum
+                        # pass
+                    elif lsa_prep != 'none':
+                        raise NotImplementedError
+                            
+                    for lsa_column in tqdm(range(bin_size)):
+                        score_matrix = np.zeros((n_bins,n_bins))
+                        
+                        # can be sped up to not recacluate all bins
+                        for i in range(n_bins):
+                            for j in range(i+1,n_bins):
+                                # print(f"swapping block {i} with block {j}", flush=True)
+                                temp_bit_count_matrix = permuted_bit_count_matrix.copy()
+                                temp_bit_count_matrix[:,j*bin_size+lsa_column] = permuted_bit_count_matrix[:,i*bin_size+lsa_column]
+                                temp_bit_count_matrix[:,i*bin_size+lsa_column] = permuted_bit_count_matrix[:,j*bin_size+lsa_column]
+                                # assert (temp_bit_count_matrix != permuted_bit_count_matrix).any()
+                                if lsa_metric == "bit_violation":
+                                    # score = np.sum(self.count_violations(temp_bit_count_matrix, bin_size, bin_bit_limit))
+                                    # print(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] - permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size])
+                                    # print(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size] - permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size])
+                                    # score = np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] - permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] \
+                                    #         + temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size] - permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size])
+                                    score = np.sum(np.clip((np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
+                                                - np.clip((np.sum(permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
+                                                + np.clip((np.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
+                                                - np.clip((np.sum(permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None))
+                                    
+                                elif lsa_metric == "num_violation":
+                                    # score = np.sum(self.count_violations(temp_bit_count_matrix, bin_size, bin_bit_limit) > 0)
+                                    score = np.sum((np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) > bin_bit_limit).astype(int) - (np.sum(permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) > bin_bit_limit).astype(int) \
+                                            + (np.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) > bin_bit_limit).astype(int) - (np.sum(permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) > bin_bit_limit).astype(int))
+                                
+                                score_matrix[i,j] = score
+                                score_matrix[j,i] = score
+                        # print(score_matrix)
+                        og_bin_indices, permuted_bin_indices = linear_sum_assignment(score_matrix)
+                        og_indices = og_bin_indices * bin_size + lsa_column
+                        permuted_indices = permuted_bin_indices * bin_size + lsa_column
+                        # print('permuted indices\n', permuted_indices)
+                        # print('og indices\n', og_indices)
+                        temp_bit_count_matrix = permuted_bit_count_matrix.copy()
+                        permuted_bit_count_matrix[:,og_indices] = permuted_bit_count_matrix[:,permuted_indices]
+                        final_permuted_indices[og_indices] = final_permuted_indices[permuted_indices]
+                        # permuted_bit_count_matrix[:,permuted_indices] = temp_bit_count_matrix[:,og_indices]
+                    
+                    if lsa_metric == 'bit_violation':
+                        curr_violations = np.sum(np.clip(self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit), a_min=0, a_max=None))
+                    elif lsa_metric == 'num_violation':
+                        curr_violations = np.sum((self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit) > 0).astype(int))
+                    
+                    if curr_violations >= prev_violations:
+                        break
+                    prev_violations = curr_violations
+
+        return permuted_bit_count_matrix, final_permuted_indices
+
+    
+
+    def count_violations(self, bit_count_matrix, bin_size, bin_bit_limit):
+        """
+        Counts the number of violations in the matrix based on the bin size and bit limit.
+        
+        Args:
+            bit_count_matrix: The matrix to check for violations.
+            bin_size: The size of each bin.
+            bin_bit_limit: The maximum number of bits allowed in each bin.
+        
+        Returns:
+            A list of violation counts for each bin.
+        """
+        n_bins = bit_count_matrix.shape[1] // bin_size
+        bin_sums = np.sum(bit_count_matrix.reshape(-1,n_bins,bin_size), axis=2)
+        return bin_sums-bin_bit_limit
+    
+    # def decode_single(self, element):
+    #     return self.huffman_codes[element]
+    
+    # def decode(self, encdoed_matrix):
+
+        
+        
+
+        
+        
+class DaHuffmanStrategy:
+    """
+    A class for Huffman encoding elements in matrices using an external library.
+    This is a wrapper around the dahuffman library for Huffman encoding.
+    """
+    
+    def __init__(self):
+        """Initialize the Huffman encoder."""
+        self.codec = None
+        self.stats = {}
+    
+    def encode(self, matrix):
+        """
+        Encode the matrix using the dahuffman library.
+        
+        Args:
+            matrix: NumPy array to encode
+            
+        Returns:
+            A dictionary with encoded data and statistics
+        """
+        
+        start_time = time.time()
+        
+        # Flatten the matrix and count frequencies
+        flattened = matrix.flatten()
+        frequencies = dict(zip(*np.unique(flattened, return_counts=True)))
+        print("Frequencies:", frequencies)
+        
+        # Create a Huffman codec
+        self.codec = HuffmanCodec.from_frequencies(frequencies)
+
+        self.codec.print_code_table()
+        
+        # Encode the flattened matrix
+        encoded_data = self.codec.encode(flattened)
+        
+        # Calculate compression metrics
+        original_size = matrix.size * np.dtype(matrix.dtype).itemsize * 8  # Size in bits
+        encoded_size = len(encoded_data) * 8  # Size in bits
+        
+        compression_ratio = original_size / encoded_size if encoded_size > 0 else 0
+
+        bit_count_matrix = np.zeros(flattened.shape, dtype=np.int32)
+        # Mapping for bit lengths (for faster lookup)
+        bit_lengths = {symbol: tup[0] for symbol, tup in self.codec.get_code_table().items()}
+        # Fill bit count matrix
+        for i in range(flattened.shape[0]):
+            bit_count_matrix[i] = bit_lengths[flattened[i]]
+        bit_count_matrix = bit_count_matrix.reshape(matrix.shape)
+        
+        end_time = time.time()
+        
+        # Store stats
+        self.stats = {
+            'frequencies': frequencies,
+            'compression_ratio': compression_ratio,
+            'original_size_bits': original_size,
+            'encoded_size_bits': int(encoded_size),
+            'execution_time': end_time - start_time
+        }
+        
+        return {
+            'encoded_data': encoded_data,
+            'bit_count_matrix': bit_count_matrix,
+            'stats': self.stats,
+            'huffman_codes': self.codec.get_code_table()
+        }
+        
+
+
+class HuffmanStrategy:
+    """
+    A class for Huffman encoding elements in matrices, 
+    optimized for performance with large data sets.
+    """
+    
+    class Node:
+        """Inner class representing a node in the Huffman tree."""
+        __slots__ = ('freq', 'symbol', 'left', 'right', 'huff')
+        
+        def __init__(self, freq, symbol, left=None, right=None):
+            self.freq = freq      # Frequency of the symbol
+            self.symbol = symbol  # Symbol value
+            self.left = left      # Left child
+            self.right = right    # Right child
+            self.huff = ''        # Direction (0/1)
+            
+        def __lt__(self, other):
+            # For priority queue comparison
+            return self.freq < other.freq
+    
+    def __init__(self):
+        """Initialize the Huffman encoder."""
+        self.huffman_codes = {}
+        self.frequencies = {}
+        self.stats = {}
+        self.root = None
+    
+    def _count_frequencies(self, matrix):
+        """Count the frequency of each unique element in the matrix."""
+        # For integer matrices, use more efficient methods
+        if np.issubdtype(matrix.dtype, np.integer) and matrix.min() >= 0:
+            max_val = matrix.max()
+            if max_val < 1_000_000:  # Only use bincount for reasonable ranges
+                counts = np.bincount(matrix.ravel())
+                return {i: count for i, count in enumerate(counts) if count > 0}
+        
+        # For other types, use unique
+        unique_values, counts = np.unique(matrix, return_counts=True)
+        return dict(zip(unique_values, counts))
+    
+    def _build_huffman_tree(self):
+        """Build a Huffman tree based on the frequencies."""
+        nodes = []
+        heapq.heapify(nodes)
+        
+        # Create leaf nodes
+        for symbol, freq in self.frequencies.items():
+            heapq.heappush(nodes, self.Node(freq, symbol))
+        
+        # Handle special case of only one unique symbol
+        if len(nodes) == 1:
+            node = heapq.heappop(nodes)
+            node.huff = '0'
+            return node
+        
+        # Build tree by combining nodes
+        while len(nodes) > 1:
+            left = heapq.heappop(nodes)
+            right = heapq.heappop(nodes)
+            
+            left.huff = '0'
+            right.huff = '1'
+            
+            # Create new internal node
+            new_node = self.Node(left.freq + right.freq, None, left, right)
+            heapq.heappush(nodes, new_node)
+        
+        return nodes[0] if nodes else None
+    
+    def _generate_codes(self):
+        """Generate Huffman codes using an iterative approach."""
+        if not self.root:
+            return {}
+        
+        codes = {}
+        stack = [(self.root, "")]
+        
+        while stack:
+            node, code = stack.pop()
+            
+            # Leaf node - assign code to symbol
+            if not node.left and not node.right:
+                codes[node.symbol] = code
+            else:
+                # Push children to stack
+                if node.right:
+                    stack.append((node.right, code + '1'))
+                if node.left:
+                    stack.append((node.left, code + '0'))
+        print('code    symbol')
+        for s, c in codes.items():
+            print(f'{c} {s}')
+        
+        return codes
+    
+    
+    def encode(self, matrix):
+        """
+        Memory-efficient version for large matrices that doesn't store the full encoded result.
+        Instead returns the bit count matrix and codes for reconstruction.
+        
+        Args:
+            matrix: NumPy array to encode
+            
+        Returns:
+            A dictionary with bit count matrix and encoding information
+        """
+
+        
+        start_time = time.time()
+
+        og_shape = matrix.shape
+        matrix = matrix.flatten()
+        
+        
+        # Get frequencies
+        self.frequencies = self._count_frequencies(matrix)
+        
+        # Build Huffman tree
+        self.root = self._build_huffman_tree()
+        
+        # Generate codes
+        self.huffman_codes = self._generate_codes()
+        
+        # Create bit count matrix only (more memory efficient)
+        bit_count_matrix = np.zeros(matrix.shape, dtype=np.int32)
+        
+        # Mapping for bit lengths (for faster lookup)
+        bit_lengths = {symbol: len(code) for symbol, code in self.huffman_codes.items()}
+        
+        # Fill bit count matrix
+        for i in range(matrix.shape[0]):
+            bit_count_matrix[i] = bit_lengths[matrix[i]]
+
+        bit_count_matrix = bit_count_matrix.reshape(og_shape)
+        
+        # Calculate compression metrics
+        original_size = matrix.size * np.dtype(matrix.dtype).itemsize * 8
+        encoded_size = np.sum(bit_count_matrix)
+        compression_ratio = original_size / encoded_size if encoded_size > 0 else 0
+        
+        end_time = time.time()
+        
+        # Store stats
+        self.stats = {
+            'frequencies': self.frequencies,
+            'compression_ratio': compression_ratio,
+            'original_size_bits': original_size,
+            'encoded_size_bits': int(encoded_size),
+            'execution_time': end_time - start_time
+        }
+        
+        return {
+            'bit_count_matrix': bit_count_matrix,
+            'huffman_codes': self.huffman_codes,
+            'stats': self.stats
+        }
+    
+    def get_encoding_stats(self):
+        """Return detailed statistics about the encoding process."""
+        if not self.huffman_codes or not self.frequencies:
+            return "No encoding has been performed yet."
+        
+        # Prepare data for a summary table
+        data = {
+            'Symbol': [],
+            'Frequency': [],
+            'Huffman Code': [],
+            'Code Length': [],
+            'Bits Used': [],
+            'Percentage': []
+        }
+        
+        total_bits = self.stats['encoded_size_bits']
+        
+        for symbol in sorted(self.huffman_codes.keys()):
+            code = self.huffman_codes[symbol]
+            freq = self.frequencies[symbol]
+            bits_used = len(code) * freq
+            percentage = (bits_used / total_bits * 100) if total_bits > 0 else 0
+            
+            data['Symbol'].append(symbol)
+            data['Frequency'].append(freq)
+            data['Huffman Code'].append(code)
+            data['Code Length'].append(len(code))
+            data['Bits Used'].append(bits_used)
+            data['Percentage'].append(round(percentage, 2))
+        
+        return pd.DataFrame(data).sort_values('Frequency', ascending=False)
+    
+    def print_summary(self):
+        """Print a summary of the encoding results."""
+        if not self.stats:
+            print("No encoding has been performed yet.")
+            return
+        
+        print(f"Compression Summary:")
+        print(f"- Original Size: {self.stats['original_size_bits']} bits")
+        print(f"- Encoded Size: {self.stats['encoded_size_bits']} bits")
+        print(f"- Compression Ratio: {self.stats['compression_ratio']:.2f}x")
+        print(f"- Execution Time: {self.stats['execution_time']:.4f} seconds")
+        print(f"- Unique Symbols: {len(self.huffman_codes)}")
+        
+        # Print frequency and code length distribution
+        print("\nCode length distribution:")
+        length_counts = {}
+        for code in self.huffman_codes.values():
+            length = len(code)
+            length_counts[length] = length_counts.get(length, 0) + 1
+        
+        for length in sorted(length_counts.keys()):
+            print(f"  {length} bits: {length_counts[length]} symbols")
+
+
+def example_usage():
+    # Create a sample matrix
+    matrix = np.array([
+        [1, 2, 3, 4],
+        [1, 2, 2, 3],
+        [3, 3, 2, 1],
+        [4, 1, 3, 2]
+    ])
+    
+    print("Original Matrix:")
+    print(matrix)
+    
+    # Create encoder and encode matrix
+    encoder = HuffmanStrategy()
+    result = encoder.encode(matrix)
+    
+    print("\nEncoded Matrix (Huffman codes):")
+    print(result['encoded_matrix'])
+    
+    print("\nBit Count Matrix (code lengths):")
+    print(result['bit_count_matrix'])
+    
+    # Print summary
+    encoder.print_summary()
+    
+    # Get detailed statistics
+    stats_df = encoder.get_encoding_stats()
+    print("\nDetailed Encoding Statistics:")
+    print(stats_df)
+    
+    # Test with a larger random matrix
+    print("\n\nTesting with larger matrix...")
+    large_matrix = np.random.randint(0, 10, size=(50, 50))
+    
+    encoder = HuffmanStrategy()
+    large_result = encoder.encode(large_matrix)
+    
+    print(f"\nLarge Matrix Shape: {large_matrix.shape}")
+    print(f"Bit Count Matrix Shape: {large_result['bit_count_matrix'].shape}")
+    
+    # Print some sample values
+    print("\nSample of original values and their bit counts:")
+    for i in range(min(5, large_matrix.shape[0])):
+        for j in range(min(5, large_matrix.shape[1])):
+            value = large_matrix[i, j]
+            code = large_result['huffman_codes'][value]
+            bits = large_result['bit_count_matrix'][i, j]
+            print(f"({i},{j}): Value={value}, Code={code}, Bits={bits}")
+    
+    # Print summary for large matrix
+    encoder.print_summary()
+
+
+
+        
+

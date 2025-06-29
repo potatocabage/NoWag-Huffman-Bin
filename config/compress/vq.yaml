@@ -1,8 +1,9 @@
+# Change to 4 bit scalar quantization
 method: LinearVQ
 kwargs:
-  d: 6
+  d: 1
   ignore_norms: true
-  n_bits: 2
+  n_bits: 4
   n_inits: 1
   n_iters: 100
   initialize_method: kmeans++
@@ -10,10 +11,6 @@ kwargs:
     deterministic: False
     multiple_each_time: 1.0
   normalizer_kwargs:
-    norm_order:
-    - 0
-    - 1
-    zero:
-    - false
-    - false
+    norm_order: []
+    zero: []
     p: 2

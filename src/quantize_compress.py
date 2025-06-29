@@ -379,12 +379,14 @@ class LinearVQ(compression_parent.CompressedLinear):
         Args:
             denormalize (bool, optional): whether to denormalize the weight matrix. Defaults to True.
         """
-        # print("here")
+        print("here")
+        print("sum of assignments", torch.sum(self.assignments))
         weight_subvectors = self.codebook[self.assignments]
         weight = weight_subvectors.reshape(self.out_features, self.padded_in_features)
         weight = weight[:, : self.in_features]
         if denormalize:
             weight = self.normalizer.denormalize(weight)
+        print('weight sum', torch.sum(weight))
         return weight
 
     def _no_checkpoint_forward(self, x: torch.FloatTensor):

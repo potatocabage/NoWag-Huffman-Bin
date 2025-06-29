@@ -45,3 +45,6 @@ outputs/*
 
 #ignore test scratch ipynbs
 *test.ipynb
+
+#ignore stored permutation matrices
+permuted_bit_count_matrices/
