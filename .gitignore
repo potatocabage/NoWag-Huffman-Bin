@@ -48,3 +48,13 @@ outputs/*
 
 #ignore stored permutation matrices
 permuted_bit_count_matrices/
+
+comparison_plots*/
+
+huffman_outputs/
+
+temp*/
+
+test_cache/
+
+*scratch*

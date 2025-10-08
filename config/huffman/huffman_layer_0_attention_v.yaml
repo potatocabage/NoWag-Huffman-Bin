@@ -3,14 +3,14 @@
 
 # Model configuration
 model:
-  name: "grid"  # Set to "grid" to automatically discover all models
-  # name: "Meta-Llama-3-8B"  # Set to "grid" to automatically discover all models
-  layer_name: "grid"  # Set to "grid" to automatically discover all layers
-  # layer_name: "layer_0/self_attn.q_proj"  # Set to "grid" to automatically discover all layers
-  # weight_path: "./models/meta-llama/Meta-Llama-3-8B/original_weights/layer_0/self_attn.q_proj.pt"  # Base directory for weights
-  # hessian_path: "./models/meta-llama/Meta-Llama-3-8B/hessianDiags/seed_0/pajama/128/layer_0/self_attn.q_proj.pt"  # Base directory for hessians
-  weight_path: "./models/meta-llama/Meta-Llama-3-8B/original_weights"  # Base directory for weights
-  hessian_path: "./models/meta-llama/Meta-Llama-3-8B/hessianDiags/seed_0/pajama/128"  # Base directory for hessians
+  name: "Meta-Llama-3-8B"  # Set to "grid" to automatically discover all models
+  layer_name: "layer_0/self_attn.v_proj"  # Set to "grid" to automatically discover all layers
+  weight_path: "./models/meta-llama/Meta-Llama-3-8B/original_weights/layer_0/self_attn.v_proj.pt"  # Base directory for weights
+  hessian_path: "./models/meta-llama/Meta-Llama-3-8B/hessianDiags/seed_0/pajama/128/layer_0/self_attn.v_proj.pt"  # Base directory for hessians
+  # name: "grid"  # Set to "grid" to automatically discover all models
+  # layer_name: "grid"  # Set to "grid" to automatically discover all layers
+  # weight_path: "./models/meta-llama/Meta-Llama-3-8B/original_weights"  # Base directory for weights
+  # hessian_path: "./models/meta-llama/Meta-Llama-3-8B/hessianDiags/seed_0/pajama/128"  # Base directory for hessians
 
 # Compression configuration
 compression:

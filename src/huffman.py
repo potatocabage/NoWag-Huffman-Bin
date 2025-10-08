@@ -47,47 +47,56 @@ class HuffmanUser:
         self.huffman_codes = res['huffman_codes']
         return res
     
-    def column_permute(self, bit_count_matrix, bin_size, bin_bit_limit, heuristic_metric, heuristic_algo, lsa_metric, lsa_prep, heuristic=True, lsa=True):
+    def column_permute(self, bit_count_matrix, bin_size, bin_bit_limit, heuristic_metric, heuristic_algo, lsa_metric, lsa_prep, heuristic=True, lsa=True, device=None):
         #TODO: return final permutation indices for use of decoding
         """
         Permutes the columns of the matrix based on the Huffman codes.
         
         Args:
-            bit_count_matrix: The matrix to permute.
+            bit_count_matrix: The matrix to permute (numpy array).
+            device: CUDA device to use for torch operations.
         
         Returns:
-            A permuted version of the input matrix.
+            A permuted version of the input matrix (numpy array) and permutation indices (numpy array).
         """
+        if device is None:
+            device = torch.device('cpu')
 
         print("bit_count_matrix shape", bit_count_matrix.shape)
 
         n_bins = bit_count_matrix.shape[1] // bin_size
 
         # pad so that columns are divisible by bin_size
-        pad = (bin_size - bit_count_matrix.shape[1] % bin_size) % bin_size
-        if pad > 0:
+        pad = bin_size - (bit_count_matrix.shape[1] % bin_size) if bit_count_matrix.shape[1] % bin_size != 0 else 0
+        if pad != 0:
+            assert pad > 0
             bit_count_matrix = np.pad(bit_count_matrix, ((0, 0), (0, pad)), mode='constant', constant_values=0)
+            n_bins += 1
+            assert bit_count_matrix.shape[1] % bin_size == 0
+            assert n_bins == bit_count_matrix.shape[1] // bin_size
+
         print("bit_count_matrix shape after padding", bit_count_matrix.shape)
 
-        
-        final_permuted_indices = np.arange(bit_count_matrix.shape[1])
+        # Convert to torch tensors for computation
+        bit_count_matrix_torch = torch.from_numpy(bit_count_matrix).to(device)
+        final_permuted_indices = torch.arange(bit_count_matrix.shape[1], device=device)
 
-        permuted_bit_count_matrix = bit_count_matrix.copy()
+        permuted_bit_count_matrix_torch = bit_count_matrix_torch.clone()
         if heuristic:
             # Apply heuristic-based column permutation
             if heuristic_metric == 'sum':
                 # Sort columns by sum of bit counts
-                col_sums = np.sum(bit_count_matrix, axis=0)
-                sorted_indices = np.argsort(col_sums)[::-1]
+                col_sums = torch.sum(bit_count_matrix_torch, axis=0)
+                sorted_indices = torch.argsort(col_sums, descending=True)
                 # print(sorted_indices)
-                print('sorted col sums', np.sort(col_sums)[::-1])
+                print('sorted col sums', torch.sort(col_sums, descending=True)[0].cpu().numpy())
             elif heuristic_metric == 'output_normed_sum':
-                output_norms = np.linalg.norm(bit_count_matrix, axis=1)
-                normalized_matrix = bit_count_matrix / (output_norms.reshape(-1,1) + 1e-10)  # Avoid division by zero
-                col_sums = np.sum(normalized_matrix, axis=0)
-                sorted_indices = np.argsort(col_sums)[::-1]
+                output_norms = torch.linalg.norm(bit_count_matrix_torch, axis=1)
+                normalized_matrix = bit_count_matrix_torch / (output_norms.reshape(-1,1) + 1e-10)  # Avoid division by zero
+                col_sums = torch.sum(normalized_matrix, axis=0)
+                sorted_indices = torch.argsort(col_sums, descending=True)
             # elif heuristic_metric == 'none':
-            #     sorted_indices = np.arange(bit_count_matrix.shape[1])
+            #     sorted_indices = torch.arange(bit_count_matrix.shape[1], device=device)
             else:
                 raise ValueError("Invalid heuristic metric. Choose 'sum' or 'output_normed_sum'.")
         
@@ -96,47 +105,28 @@ class HuffmanUser:
                 for i in range(len(sorted_indices)):
                     pi = (i % n_bins) * bin_size + (i // n_bins)
                     # print(pi)
-                    permuted_bit_count_matrix[:, pi] = bit_count_matrix[:, sorted_indices[i]]
+                    permuted_bit_count_matrix_torch[:, pi] = bit_count_matrix_torch[:, sorted_indices[i]]
                     final_permuted_indices[pi] = sorted_indices[i]
 
             #TODO: only works for even bin size
             elif heuristic_algo == "min_max":
+                assert len(sorted_indices) % 2 == 0
                 for i in range(len(sorted_indices)//2):
                     pi = (i % n_bins) * bin_size + (i // n_bins)
-                    permuted_bit_count_matrix[:, pi] = bit_count_matrix[:, sorted_indices[i]]
+                    permuted_bit_count_matrix_torch[:, pi] = bit_count_matrix_torch[:, sorted_indices[i]]
                     final_permuted_indices[pi] = sorted_indices[i]
 
                     pj = ((i % n_bins)+1) * bin_size - ((i // n_bins)+1)
-                    permuted_bit_count_matrix[:, pj] = bit_count_matrix[:, sorted_indices[-(i+1)]]
+                    permuted_bit_count_matrix_torch[:, pj] = bit_count_matrix_torch[:, sorted_indices[-(i+1)]]
                     final_permuted_indices[pj] = sorted_indices[-(i+1)]
                     # print(f"{pi}, {pj}")
-            assert (sorted(final_permuted_indices) == np.arange(bit_count_matrix.shape[1])).all()
-            
+            assert torch.all(torch.sort(final_permuted_indices)[0] == torch.arange(bit_count_matrix.shape[1], device=device))
+        is_permutation_after_heuristic = torch.all(torch.sort(final_permuted_indices)[0] == torch.arange(final_permuted_indices.size, device=device))
+        print('is_permutation_after_heuristic', is_permutation_after_heuristic.item())
+        assert is_permutation_after_heuristic
 
             
         if lsa:
-            # # TODO: Need to shuffle each bin in order for LSA to do anything
-            # # trying to flip every other bin first
-            # if lsa_prep == 'flip':
-            #     for bin_i in range(n_bins):
-            #         if bin_i % 2:
-            #             permuted_bit_count_matrix[:,bin_i*bin_size:(bin_i+1)*bin_size] = permuted_bit_count_matrix[:,(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
-            # elif lsa_prep == 'shuffle':
-            #     # permuted_bit_count_matrix = permuted_bit_count_matrix.reshape(-1,n_bins,bin_size)
-            #     # permuted_bit_count_matrix = np.transpose(permuted_bit_count_matrix, (-1,0,1))
-            #     # permuted_bit_count_matrix = np.shuffle
-            #     old_sum = np.sum(permuted_bit_count_matrix)
-            #     for i in range(n_bins):
-            #         shuffled_bin = permuted_bit_count_matrix[i*bin_size:(i+1)*bin_size].copy().T
-            #         np.random.shuffle(shuffled_bin)
-            #         permuted_bit_count_matrix[i*bin_size:(i+1)*bin_size] = shuffled_bin.T
-            #     new_sum = np.sum(permuted_bit_count_matrix)
-            #     assert old_sum == new_sum
-            #     # pass
-            # elif lsa_prep != 'none':
-            #     raise NotImplementedError
-
-
             # Apply LSA-based column permutation
             # Currently this is iterative
             # TODO: KEEP ITERATING UNTIL AN EARLY STOP IS TRIGGERED
@@ -144,9 +134,11 @@ class HuffmanUser:
             num_iterations = 10
             print('num iterations', num_iterations)
             if lsa_metric == 'bit_violation':
-                prev_violations = np.sum(np.clip(self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit), a_min=0, a_max=None))
+                violations_torch = self.count_violations_torch(permuted_bit_count_matrix_torch, bin_size, bin_bit_limit)
+                prev_violations = torch.sum(torch.clamp(violations_torch, min=0)).item()
             elif lsa_metric == 'num_violation':
-                prev_violations = np.sum((self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit) > 0).astype(int))
+                violations_torch = self.count_violations_torch(permuted_bit_count_matrix_torch, bin_size, bin_bit_limit)
+                prev_violations = torch.sum((violations_torch > 0).int()).item()
 
             os.makedirs('lsa_progress_logs', exist_ok=True)
             with open(os.path.join('lsa_progress_logs', f'4_to_3__{lsa_prep}__{lsa_metric}.txt'), 'w') as f:
@@ -158,76 +150,91 @@ class HuffmanUser:
                     if lsa_prep == 'flip':
                         for bin_i in range(n_bins):
                             if bin_i % 2:
-                                permuted_bit_count_matrix[:,bin_i*bin_size:(bin_i+1)*bin_size] = permuted_bit_count_matrix[:,(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
+                                permuted_bit_count_matrix_torch[:,bin_i*bin_size:(bin_i+1)*bin_size] = permuted_bit_count_matrix_torch[:,(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
                                 final_permuted_indices[bin_i*bin_size:(bin_i+1)*bin_size] = final_permuted_indices[(bin_i+1)*bin_size-1:bin_i*bin_size-1:-1]
                     elif lsa_prep == 'shuffle':
-                        # permuted_bit_count_matrix = permuted_bit_count_matrix.reshape(-1,n_bins,bin_size)
-                        # permuted_bit_count_matrix = np.transpose(permuted_bit_count_matrix, (-1,0,1))
-                        # permuted_bit_count_matrix = np.shuffle
-                        old_sum = np.sum(permuted_bit_count_matrix)
+                        old_sum = torch.sum(permuted_bit_count_matrix_torch)
 
                         for i in range(n_bins):
-                            shuffled_bin = permuted_bit_count_matrix[:, i*bin_size:(i+1)*bin_size].copy().T
-                            # print('shuffled bin transpose shape', shuffled_bin.shape)
-                            shuffled_bin = np.hstack((shuffled_bin, final_permuted_indices[i*bin_size:(i+1)*bin_size].reshape(-1,1)))
-                            np.random.shuffle(shuffled_bin)
-                            permuted_bit_count_matrix[:, i*bin_size:(i+1)*bin_size] = shuffled_bin[:,:-1].T
-                            final_permuted_indices[i*bin_size:(i+1)*bin_size] = shuffled_bin[:,-1].T
+                            shuffled_bin = permuted_bit_count_matrix_torch[:, i*bin_size:(i+1)*bin_size].clone().T
+                            shuffled_indices = final_permuted_indices[i*bin_size:(i+1)*bin_size].clone()
+                            # Create combined tensor for shuffling
+                            combined = torch.cat([shuffled_bin, shuffled_indices.unsqueeze(1)], dim=1)
+                            # Generate random permutation indices
+                            perm_indices = torch.randperm(combined.shape[0], device=device)
+                            combined = combined[perm_indices]
+                            # Split back
+                            permuted_bit_count_matrix_torch[:, i*bin_size:(i+1)*bin_size] = combined[:,:-1].T
+                            final_permuted_indices[i*bin_size:(i+1)*bin_size] = combined[:,-1]
 
-                        new_sum = np.sum(permuted_bit_count_matrix)
-                        assert old_sum == new_sum
-                        # pass
+                        new_sum = torch.sum(permuted_bit_count_matrix_torch)
+                        assert torch.allclose(old_sum, new_sum)
                     elif lsa_prep != 'none':
                         raise NotImplementedError
                             
                     for lsa_column in tqdm(range(bin_size)):
-                        score_matrix = np.zeros((n_bins,n_bins))
+                        score_matrix = torch.zeros((n_bins,n_bins), device=device)
                         
                         # can be sped up to not recacluate all bins
                         for i in range(n_bins):
                             for j in range(i+1,n_bins):
                                 # print(f"swapping block {i} with block {j}", flush=True)
-                                temp_bit_count_matrix = permuted_bit_count_matrix.copy()
-                                temp_bit_count_matrix[:,j*bin_size+lsa_column] = permuted_bit_count_matrix[:,i*bin_size+lsa_column]
-                                temp_bit_count_matrix[:,i*bin_size+lsa_column] = permuted_bit_count_matrix[:,j*bin_size+lsa_column]
-                                # assert (temp_bit_count_matrix != permuted_bit_count_matrix).any()
+                                temp_bit_count_matrix = permuted_bit_count_matrix_torch.clone()
+                                temp_bit_count_matrix[:,j*bin_size+lsa_column] = permuted_bit_count_matrix_torch[:,i*bin_size+lsa_column]
+                                temp_bit_count_matrix[:,i*bin_size+lsa_column] = permuted_bit_count_matrix_torch[:,j*bin_size+lsa_column]
+                                # assert (temp_bit_count_matrix != permuted_bit_count_matrix_torch).any()
                                 if lsa_metric == "bit_violation":
-                                    # score = np.sum(self.count_violations(temp_bit_count_matrix, bin_size, bin_bit_limit))
-                                    # print(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] - permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size])
-                                    # print(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size] - permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size])
-                                    # score = np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] - permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size] \
-                                    #         + temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size] - permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size])
-                                    score = np.sum(np.clip((np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
-                                                - np.clip((np.sum(permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
-                                                + np.clip((np.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None) \
-                                                - np.clip((np.sum(permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) - bin_bit_limit), a_min=0, a_max=None))
+                                    # Calculate violations for both bins
+                                    bin_i_sum = torch.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size], axis=1)
+                                    bin_j_sum = torch.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size], axis=1)
+                                    orig_bin_i_sum = torch.sum(permuted_bit_count_matrix_torch[:,i*bin_size:(i+1)*bin_size], axis=1)
+                                    orig_bin_j_sum = torch.sum(permuted_bit_count_matrix_torch[:,j*bin_size:(j+1)*bin_size], axis=1)
+                                    
+                                    score = torch.sum(torch.clamp(bin_i_sum - bin_bit_limit, min=0) - torch.clamp(orig_bin_i_sum - bin_bit_limit, min=0) + 
+                                                     torch.clamp(bin_j_sum - bin_bit_limit, min=0) - torch.clamp(orig_bin_j_sum - bin_bit_limit, min=0))
                                     
                                 elif lsa_metric == "num_violation":
-                                    # score = np.sum(self.count_violations(temp_bit_count_matrix, bin_size, bin_bit_limit) > 0)
-                                    score = np.sum((np.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) > bin_bit_limit).astype(int) - (np.sum(permuted_bit_count_matrix[:,i*bin_size:(i+1)*bin_size],axis=1) > bin_bit_limit).astype(int) \
-                                            + (np.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) > bin_bit_limit).astype(int) - (np.sum(permuted_bit_count_matrix[:,j*bin_size:(j+1)*bin_size],axis=1) > bin_bit_limit).astype(int))
+                                    bin_i_sum = torch.sum(temp_bit_count_matrix[:,i*bin_size:(i+1)*bin_size], axis=1)
+                                    bin_j_sum = torch.sum(temp_bit_count_matrix[:,j*bin_size:(j+1)*bin_size], axis=1)
+                                    orig_bin_i_sum = torch.sum(permuted_bit_count_matrix_torch[:,i*bin_size:(i+1)*bin_size], axis=1)
+                                    orig_bin_j_sum = torch.sum(permuted_bit_count_matrix_torch[:,j*bin_size:(j+1)*bin_size], axis=1)
+                                    
+                                    score = torch.sum((bin_i_sum > bin_bit_limit).int() - (orig_bin_i_sum > bin_bit_limit).int() + 
+                                                     (bin_j_sum > bin_bit_limit).int() - (orig_bin_j_sum > bin_bit_limit).int())
                                 
                                 score_matrix[i,j] = score
                                 score_matrix[j,i] = score
                         # print(score_matrix)
-                        og_bin_indices, permuted_bin_indices = linear_sum_assignment(score_matrix)
+                        # Convert to numpy for scipy linear_sum_assignment
+                        score_matrix_np = score_matrix.cpu().numpy()
+                        og_bin_indices, permuted_bin_indices = linear_sum_assignment(score_matrix_np)
                         og_indices = og_bin_indices * bin_size + lsa_column
                         permuted_indices = permuted_bin_indices * bin_size + lsa_column
                         # print('permuted indices\n', permuted_indices)
                         # print('og indices\n', og_indices)
-                        temp_bit_count_matrix = permuted_bit_count_matrix.copy()
-                        permuted_bit_count_matrix[:,og_indices] = permuted_bit_count_matrix[:,permuted_indices]
-                        final_permuted_indices[og_indices] = final_permuted_indices[permuted_indices]
-                        # permuted_bit_count_matrix[:,permuted_indices] = temp_bit_count_matrix[:,og_indices]
-                    
+                        temp_bit_count_matrix = permuted_bit_count_matrix_torch.clone()
+                        temp_indices = final_permuted_indices.clone()
+                        permuted_bit_count_matrix_torch[:,og_indices] = permuted_bit_count_matrix_torch[:,permuted_indices]
+                        final_permuted_indices[og_indices] = temp_indices[permuted_indices]
+                        
                     if lsa_metric == 'bit_violation':
-                        curr_violations = np.sum(np.clip(self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit), a_min=0, a_max=None))
+                        violations_torch = self.count_violations_torch(permuted_bit_count_matrix_torch, bin_size, bin_bit_limit)
+                        curr_violations = torch.sum(torch.clamp(violations_torch, min=0)).item()
                     elif lsa_metric == 'num_violation':
-                        curr_violations = np.sum((self.count_violations(permuted_bit_count_matrix, bin_size, bin_bit_limit) > 0).astype(int))
+                        violations_torch = self.count_violations_torch(permuted_bit_count_matrix_torch, bin_size, bin_bit_limit)
+                        curr_violations = torch.sum((violations_torch > 0).int()).item()
                     
                     if curr_violations >= prev_violations:
                         break
                     prev_violations = curr_violations
+        
+        is_permutation_after_lsa = torch.all(torch.sort(final_permuted_indices)[0] == torch.arange(final_permuted_indices.size, device=device))
+        print('is_permutation_after_lsa', is_permutation_after_lsa.item())
+        assert is_permutation_after_lsa
+
+        # Convert back to numpy arrays for compatibility with downstream code
+        permuted_bit_count_matrix = permuted_bit_count_matrix_torch.cpu().numpy()
+        final_permuted_indices = final_permuted_indices.cpu().numpy()
 
         return permuted_bit_count_matrix, final_permuted_indices
 
@@ -248,6 +255,22 @@ class HuffmanUser:
         n_bins = bit_count_matrix.shape[1] // bin_size
         bin_sums = np.sum(bit_count_matrix.reshape(-1,n_bins,bin_size), axis=2)
         return bin_sums-bin_bit_limit
+    
+    def count_violations_torch(self, bit_count_matrix_torch, bin_size, bin_bit_limit):
+        """
+        Counts the number of violations in the matrix based on the bin size and bit limit using torch.
+        
+        Args:
+            bit_count_matrix_torch: The torch tensor matrix to check for violations.
+            bin_size: The size of each bin.
+            bin_bit_limit: The maximum number of bits allowed in each bin.
+        
+        Returns:
+            A torch tensor of violation counts for each bin.
+        """
+        n_bins = bit_count_matrix_torch.shape[1] // bin_size
+        bin_sums = torch.sum(bit_count_matrix_torch.reshape(-1,n_bins,bin_size), axis=2)
+        return bin_sums - bin_bit_limit
     
     # def decode_single(self, element):
     #     return self.huffman_codes[element]
@@ -519,6 +542,7 @@ class HuffmanStrategy:
             data['Bits Used'].append(bits_used)
             data['Percentage'].append(round(percentage, 2))
         
+        import pandas as pd
         return pd.DataFrame(data).sort_values('Frequency', ascending=False)
     
     def print_summary(self):
